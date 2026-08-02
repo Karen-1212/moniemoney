@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""$100k relative-PE portfolio backtest vs S&P 500 Health Care; Excel deliverable."""
+"""$100k relative-PE/PB portfolio backtest vs S&P 500 sector index; Excel deliverable."""
 
 from __future__ import annotations
 
@@ -25,135 +25,250 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src import sector_dir
-from src.pair_select import THRESHOLDS
+from src import DEFAULT_SECTOR, sector_dir
+from src.pair_select import THRESHOLDS, select_top_significant_pairs, thresholds_for
 
 
 INITIAL_CAPITAL = 100_000.0
-SCORE_MIN = 0.5
+TOP_N_PAIRS = 10
 WARMUP = 126
-BENCH_LABEL = "S&P 500 Health Care"
-BENCH_PRIMARY = "^SP500-35"
-BENCH_FALLBACK = "XLV"
+
+SECTOR_BENCHMARKS: dict[str, dict[str, str]] = {
+    "Consumer Discretionary": {
+        "label": "S&P 500 Consumer Discretionary",
+        "primary": "^SP500-25",
+        "fallback": "XLY",
+    },
+}
 
 
-def load_eligible_pairs(cand_path: Path) -> pd.DataFrame:
-    cand = pd.read_csv(cand_path)
-    elig = cand.loc[cand["score"] > SCORE_MIN].copy()
-    elig = elig.sort_values("score", ascending=False).reset_index(drop=True)
-    return elig
+def load_eligible_pairs(
+    out_dir: Path,
+    panel: pd.DataFrame,
+    metric: str,
+    top_n: int = TOP_N_PAIRS,
+    score_min_days: int = 252,
+    members: pd.DataFrame | None = None,
+    significant: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Top-N same-subindustry significant pairs ranked by mean-reversion score (≤N → take all)."""
+    if significant is None:
+        sig_path = out_dir / f"significant_{metric}_pairs.csv"
+        if not sig_path.exists():
+            return pd.DataFrame()
+        try:
+            significant = pd.read_csv(sig_path)
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+    if significant is None or significant.empty:
+        return pd.DataFrame()
+    if members is None:
+        members_path = out_dir / "members.csv"
+        members = pd.read_csv(members_path) if members_path.exists() else None
+    return select_top_significant_pairs(
+        panel,
+        significant,
+        metric=metric,
+        top_n=top_n,
+        score_min_days=score_min_days,
+        members=members,
+    )
 
 
-def generate_pair_trades(
-    pe: pd.DataFrame,
+def _precompute_pair_series(
+    panel: pd.DataFrame,
     close: pd.DataFrame,
     a: str,
     b: str,
-    start: pd.Timestamp,
-    slot_notional: float,
-) -> tuple[list[dict], pd.Series]:
-    """Expanding-z pair trades from `start`."""
-    z_entry = THRESHOLDS["z_entry"]
-    z_exit = THRESHOLDS["z_exit"]
-
-    common = pe[[a, b]].join(close[[a, b]], lsuffix="_pe", rsuffix="_px", how="inner")
+    metric: str,
+) -> pd.DataFrame | None:
+    """Expanding z and leg returns for one pair; index = overlapping valid days."""
+    suf = f"_{metric}"
+    if a not in panel.columns or b not in panel.columns:
+        return None
+    if a not in close.columns or b not in close.columns:
+        return None
+    common = panel[[a, b]].join(close[[a, b]], lsuffix=suf, rsuffix="_px", how="inner")
     common = common.dropna()
-    common = common[(common[f"{a}_pe"] > 0) & (common[f"{b}_pe"] > 0)]
-    if common.empty:
-        return [], pd.Series(dtype=float)
-
-    spread = np.log(common[f"{a}_pe"] / common[f"{b}_pe"])
+    common = common[(common[f"{a}{suf}"] > 0) & (common[f"{b}{suf}"] > 0)]
+    if len(common) < WARMUP + 2:
+        return None
+    spread = np.log(common[f"{a}{suf}"] / common[f"{b}{suf}"])
     mu = spread.expanding(min_periods=WARMUP).mean()
     sd = spread.expanding(min_periods=WARMUP).std(ddof=1)
     z = (spread - mu) / sd
+    out = pd.DataFrame(
+        {
+            "z": z,
+            "ret_a": common[f"{a}_px"].pct_change(),
+            "ret_b": common[f"{b}_px"].pct_change(),
+        },
+        index=common.index,
+    )
+    return out
 
-    ret_a = common[f"{a}_px"].pct_change()
-    ret_b = common[f"{b}_px"].pct_change()
 
-    daily_pnl = pd.Series(0.0, index=common.index, dtype=float)
-    trades: list[dict] = []
+def simulate_sector_portfolio(
+    panel: pd.DataFrame,
+    close: pd.DataFrame,
+    elig: pd.DataFrame,
+    start: pd.Timestamp,
+    capital: float,
+    metric: str = "pe",
+    max_slots: int = TOP_N_PAIRS,
+) -> tuple[list[dict], pd.Series]:
+    """
+    Joint sector backtest: $capital split equally among currently open trades.
 
-    pos_a = 0.0
-    pos_b = 0.0
+    Daily: accrue PnL at capital/n → exits → entries (score order, n < max_slots)
+    → next day's n updates the equal split. Cash when n=0.
+    """
+    t = thresholds_for(metric)
+    z_entry = t["z_entry"]
+    z_exit = t["z_exit"]
 
-    dates = common.index
-    for i in range(1, len(dates)):
-        dt = dates[i]
-        zi = z.iloc[i]
-        ra = float(ret_a.iloc[i]) if np.isfinite(ret_a.iloc[i]) else 0.0
-        rb = float(ret_b.iloc[i]) if np.isfinite(ret_b.iloc[i]) else 0.0
+    if elig is None or elig.empty:
+        return [], pd.Series(dtype=float)
 
-        if pos_a != 0:
-            day_ret = 0.5 * pos_a * ra + 0.5 * pos_b * rb
-            daily_pnl.iloc[i] = slot_notional * day_ret
-
-        if not np.isfinite(zi):
+    pair_meta: list[dict] = []
+    for rank, row in elig.reset_index(drop=True).iterrows():
+        a, b = str(row["symbol_a"]), str(row["symbol_b"])
+        series = _precompute_pair_series(panel, close, a, b, metric)
+        if series is None:
             continue
+        pair_meta.append(
+            {
+                "rank": int(rank),
+                "symbol_a": a,
+                "symbol_b": b,
+                "pair": f"{a}-{b}",
+                "score": float(row.get("score", np.nan)),
+                "series": series,
+            }
+        )
+    if not pair_meta:
+        return [], pd.Series(dtype=float)
 
-        if pos_a == 0:
-            if dt >= start and abs(zi) >= z_entry:
-                if zi > 0:
+    # Score rank already from elig; keep that order for entry priority
+    calendar = close.index.sort_values()
+    calendar = calendar[calendar >= panel.index.min()]
+    daily_pnl = pd.Series(0.0, index=calendar, dtype=float)
+
+    # pid -> open state
+    open_pos: dict[str, dict] = {}
+    closed_trades: list[dict] = []
+
+    def _finalize(st: dict, close_dt: pd.Timestamp, exit_z: float) -> None:
+        notionals = st["notionals"]
+        avg_notional = float(np.mean(notionals)) if notionals else 0.0
+        pnl = float(st["pnl"])
+        closed_trades.append(
+            {
+                "symbol_a": st["symbol_a"],
+                "symbol_b": st["symbol_b"],
+                "pair": st["pair"],
+                "score": st["score"],
+                "open_date": st["open_date"],
+                "close_date": close_dt,
+                "direction": st["direction"],
+                "entry_z": st["entry_z"],
+                "exit_z": exit_z,
+                "hold_days": int(st["hold_days"]),
+                "slot_notional": avg_notional,
+                "pnl_usd": pnl,
+                "return": (pnl / avg_notional) if avg_notional else np.nan,
+            }
+        )
+
+    for i in range(1, len(calendar)):
+        dt = calendar[i]
+        n_open = len(open_pos)
+        notional = (capital / n_open) if n_open else 0.0
+
+        # 1) Accrue PnL for positions held overnight
+        day_total = 0.0
+        if n_open and dt >= start:
+            for st in open_pos.values():
+                ser = st["series"]
+                if dt not in ser.index:
+                    continue
+                ra = ser.at[dt, "ret_a"]
+                rb = ser.at[dt, "ret_b"]
+                ra = float(ra) if np.isfinite(ra) else 0.0
+                rb = float(rb) if np.isfinite(rb) else 0.0
+                day_ret = 0.5 * st["pos_a"] * ra + 0.5 * st["pos_b"] * rb
+                dollar = notional * day_ret
+                st["pnl"] += dollar
+                st["notionals"].append(notional)
+                st["hold_days"] += 1
+                day_total += dollar
+        daily_pnl.iloc[i] = day_total
+
+        # 2) Exits
+        to_close: list[str] = []
+        for pid, st in open_pos.items():
+            ser = st["series"]
+            if dt not in ser.index:
+                continue
+            zi = ser.at[dt, "z"]
+            if np.isfinite(zi) and abs(float(zi)) <= z_exit:
+                to_close.append(pid)
+        for pid in to_close:
+            st = open_pos.pop(pid)
+            zi = st["series"].at[dt, "z"] if dt in st["series"].index else np.nan
+            _finalize(st, dt, float(zi) if np.isfinite(zi) else np.nan)
+
+        # 3) Entries (score order), only on/after trade start
+        if dt >= start:
+            for meta in pair_meta:
+                if len(open_pos) >= max_slots:
+                    break
+                pid = meta["pair"]
+                if pid in open_pos:
+                    continue
+                ser = meta["series"]
+                if dt not in ser.index:
+                    continue
+                zi = ser.at[dt, "z"]
+                if not np.isfinite(zi) or abs(float(zi)) < z_entry:
+                    continue
+                zi_f = float(zi)
+                a, b = meta["symbol_a"], meta["symbol_b"]
+                if zi_f > 0:
                     pos_a, pos_b = -1.0, 1.0
                     direction = f"short {a} / long {b}"
                 else:
                     pos_a, pos_b = 1.0, -1.0
                     direction = f"long {a} / short {b}"
-                trades.append(
-                    {
-                        "symbol_a": a,
-                        "symbol_b": b,
-                        "pair": f"{a}-{b}",
-                        "open_date": dt,
-                        "close_date": pd.NaT,
-                        "direction": direction,
-                        "entry_z": float(zi),
-                        "exit_z": np.nan,
-                        "hold_days": np.nan,
-                        "slot_notional": slot_notional,
-                        "pnl_usd": np.nan,
-                        "return": np.nan,
-                        "_entry_i": i,
-                        "_open": True,
-                    }
-                )
-        else:
-            if abs(zi) <= z_exit:
-                for t in reversed(trades):
-                    if t.get("_open") and t["symbol_a"] == a and t["symbol_b"] == b:
-                        ei = t["_entry_i"]
-                        pnl = float(daily_pnl.iloc[ei + 1 : i + 1].sum())
-                        t["close_date"] = dt
-                        t["exit_z"] = float(zi)
-                        t["hold_days"] = i - ei
-                        t["pnl_usd"] = pnl
-                        t["return"] = pnl / slot_notional if slot_notional else np.nan
-                        t["_open"] = False
-                        break
-                pos_a = pos_b = 0.0
+                open_pos[pid] = {
+                    "symbol_a": a,
+                    "symbol_b": b,
+                    "pair": pid,
+                    "score": meta["score"],
+                    "pos_a": pos_a,
+                    "pos_b": pos_b,
+                    "direction": direction,
+                    "entry_z": zi_f,
+                    "open_date": dt,
+                    "series": ser,
+                    "pnl": 0.0,
+                    "notionals": [],
+                    "hold_days": 0,
+                }
 
-    if pos_a != 0:
-        last_i = len(dates) - 1
-        last_dt = dates[last_i]
-        for t in reversed(trades):
-            if t.get("_open") and t["symbol_a"] == a and t["symbol_b"] == b:
-                ei = t["_entry_i"]
-                pnl = float(daily_pnl.iloc[ei + 1 :].sum())
-                t["close_date"] = last_dt
-                t["exit_z"] = float(z.iloc[last_i]) if np.isfinite(z.iloc[last_i]) else np.nan
-                t["hold_days"] = last_i - ei
-                t["pnl_usd"] = pnl
-                t["return"] = pnl / slot_notional if slot_notional else np.nan
-                t["_open"] = False
-                break
+    # Force-close anything still open at the end
+    if open_pos:
+        last_dt = calendar[-1]
+        for pid, st in list(open_pos.items()):
+            zi = np.nan
+            if last_dt in st["series"].index:
+                zval = st["series"].at[last_dt, "z"]
+                zi = float(zval) if np.isfinite(zval) else np.nan
+            _finalize(st, last_dt, zi)
+            del open_pos[pid]
 
     daily_pnl = daily_pnl.loc[daily_pnl.index >= start]
-    clean_trades = []
-    for t in trades:
-        if t.get("_open"):
-            continue
-        clean_trades.append({k: v for k, v in t.items() if not k.startswith("_")})
-
-    return clean_trades, daily_pnl
+    return closed_trades, daily_pnl
 
 
 def _download_close(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
@@ -182,28 +297,28 @@ def _download_close(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.S
     return px
 
 
-def fetch_healthcare_equity(
+def fetch_benchmark_equity(
     start: pd.Timestamp,
     end: pd.Timestamp,
     calendar: pd.DatetimeIndex,
+    primary: str,
+    fallback: str,
+    capital: float = INITIAL_CAPITAL,
 ) -> tuple[pd.Series, str]:
-    """
-    $100k buy-and-hold in S&P 500 Health Care.
-    Prefer ^SP500-35; fall back to XLV. Series always labeled as S&P 500 Health Care.
-    """
-    used = BENCH_PRIMARY
+    """$100k buy-and-hold in the sector index (primary), with ETF fallback."""
+    used = primary
     try:
-        px = _download_close(BENCH_PRIMARY, start, end)
-        print(f"Benchmark: using {BENCH_PRIMARY}")
+        px = _download_close(primary, start, end)
+        print(f"Benchmark: using {primary}")
     except Exception as exc:
-        print(f"Benchmark: {BENCH_PRIMARY} failed ({exc}); falling back to {BENCH_FALLBACK}")
-        px = _download_close(BENCH_FALLBACK, start, end)
-        used = BENCH_FALLBACK
+        print(f"Benchmark: {primary} failed ({exc}); falling back to {fallback}")
+        px = _download_close(fallback, start, end)
+        used = fallback
 
     aligned = px.reindex(calendar).ffill().bfill()
     base = float(aligned.iloc[0])
-    equity = INITIAL_CAPITAL * (aligned / base)
-    equity.name = "healthcare_value"
+    equity = capital * (aligned / base)
+    equity.name = "benchmark_value"
     return equity, used
 
 
@@ -213,18 +328,20 @@ def max_drawdown(equity: pd.Series) -> float:
     return float(dd.min()) if len(dd) else np.nan
 
 
-def render_performance_history_png(equity_df: pd.DataFrame) -> bytes:
+def render_performance_history_png(
+    equity_df: pd.DataFrame, bench_label: str, strategy_label: str = "Relative-PE Strategy"
+) -> bytes:
     """Performance History–style cumulative % chart with labeled axes."""
     dates = pd.to_datetime(equity_df["date"])
     strat_pct = equity_df["strategy_return_pct"].to_numpy(dtype=float) * 100.0
-    hc_pct = equity_df["healthcare_return_pct"].to_numpy(dtype=float) * 100.0
+    bench_pct = equity_df["benchmark_return_pct"].to_numpy(dtype=float) * 100.0
 
     fig, ax = plt.subplots(figsize=(11, 5.5), dpi=140)
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    ax.plot(dates, strat_pct, color="#2F6FED", linewidth=1.8, label="Relative-PE Strategy")
-    ax.plot(dates, hc_pct, color="#2C3E50", linewidth=1.8, label=BENCH_LABEL)
+    ax.plot(dates, strat_pct, color="#2F6FED", linewidth=1.8, label=strategy_label)
+    ax.plot(dates, bench_pct, color="#2C3E50", linewidth=1.8, label=bench_label)
 
     ax.axhline(0.0, color="#9AA0A6", linewidth=0.9)
     ax.set_title("PERFORMANCE HISTORY", fontsize=14, fontweight="bold", color="#1A73E8", loc="left", pad=12)
@@ -261,15 +378,17 @@ def write_excel(
     equity_df: pd.DataFrame,
     trades_df: pd.DataFrame,
     chart_png: bytes,
+    bench_label: str,
+    strategy_label: str = "Relative-PE Strategy",
 ) -> None:
     wb = Workbook()
 
     # --- Summary ---
     ws = wb.active
     ws.title = "Summary"
-    ws["A1"] = "Relative-PE Portfolio Backtest"
+    ws["A1"] = f"{strategy_label} Portfolio Backtest"
     ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = f"Strategy vs {BENCH_LABEL} buy-and-hold"
+    ws["A2"] = f"Strategy vs {bench_label} buy-and-hold"
     row = 4
     for label, value in summary_rows:
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
@@ -283,7 +402,7 @@ def write_excel(
         row += 1
 
     row += 1
-    ws.cell(row=row, column=1, value="Eligible pairs (score > 0.5)").font = Font(bold=True)
+    ws.cell(row=row, column=1, value=f"Traded pairs (top {TOP_N_PAIRS} significant by score)").font = Font(bold=True)
     row += 1
     headers = list(pairs_df.columns)
     for c, h in enumerate(headers, 1):
@@ -308,13 +427,11 @@ def write_excel(
     eq = equity_df.copy()
     eq["date"] = pd.to_datetime(eq["date"]).dt.tz_localize(None)
     # Friendly headers for Excel chart
-    eq_out = eq.rename(
-        columns={
-            "strategy_return_pct": "Relative-PE Strategy (%)",
-            "healthcare_return_pct": f"{BENCH_LABEL} (%)",
-        }
-    )
-    # Store % as percentage points * 100 for readable chart? Better store as Excel % (0.1 = 10%)
+    rename = {
+        "strategy_return_pct": f"{strategy_label} (%)",
+        "benchmark_return_pct": f"{bench_label} (%)",
+    }
+    eq_out = eq.rename(columns={k: v for k, v in rename.items() if k in eq.columns})
     display = eq_out.copy()
     for r_idx, row_data in enumerate(dataframe_to_rows(display, index=False, header=True), 1):
         for c_idx, val in enumerate(row_data, 1):
@@ -325,14 +442,13 @@ def write_excel(
             col_name = display.columns[c_idx - 1]
             if col_name == "date":
                 cell.number_format = "YYYY-MM-DD"
-            elif col_name in ("strategy_value", "healthcare_value"):
+            elif col_name in ("strategy_value", "benchmark_value"):
                 cell.number_format = "#,##0.00"
             elif "(%)" in str(col_name) or col_name.endswith("_pct"):
                 cell.number_format = "0.00%"
 
     n_eq = len(display) + 1
-    # Interactive % chart on Equity (cols for strategy/healthcare return %)
-    # Column order: date, strategy_value, healthcare_value, Relative-PE Strategy (%), S&P 500 Health Care (%)
+    # Column order: date, strategy_value, benchmark_value, strategy (%), sector index (%)
     chart = LineChart()
     chart.title = "PERFORMANCE HISTORY"
     chart.style = 10
@@ -384,61 +500,104 @@ def write_excel(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sector", default="Health Care")
+    parser = argparse.ArgumentParser(description="Consumer Discretionary relative-PE portfolio backtest")
+    parser.add_argument("--sector", default=DEFAULT_SECTOR)
     parser.add_argument("--capital", type=float, default=INITIAL_CAPITAL)
-    parser.add_argument("--score-min", type=float, default=SCORE_MIN)
+    parser.add_argument("--top-n", type=int, default=TOP_N_PAIRS, help="Max significant pairs to trade")
     args = parser.parse_args()
+    metric = "pe"
+    strategy_label = "Relative-PE Strategy"
+    t = thresholds_for(metric)
+
+    if args.sector not in SECTOR_BENCHMARKS:
+        known = ", ".join(sorted(SECTOR_BENCHMARKS))
+        raise SystemExit(f"Unsupported sector {args.sector!r}. Use: {known}")
+
+    bench_cfg = SECTOR_BENCHMARKS[args.sector]
+    bench_label = bench_cfg["label"]
 
     out_dir = sector_dir(args.sector)
-    pe = pd.read_csv(out_dir / "pe.csv", index_col=0, parse_dates=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    panel = pd.read_csv(out_dir / "pe.csv", index_col=0, parse_dates=True)
     close = pd.read_csv(out_dir / "close.csv", index_col=0, parse_dates=True)
-    pe.index = pd.to_datetime(pe.index).tz_localize(None).normalize()
+    members = pd.read_csv(out_dir / "members.csv")
+    panel.index = pd.to_datetime(panel.index).tz_localize(None).normalize()
     close.index = pd.to_datetime(close.index).tz_localize(None).normalize()
 
-    elig = load_eligible_pairs(out_dir / "relative_pe_candidates.csv")
-    elig = elig.loc[elig["score"] > args.score_min].copy()
-    if elig.empty:
-        raise SystemExit("No pairs with score > threshold")
+    elig = load_eligible_pairs(
+        out_dir,
+        panel,
+        metric=metric,
+        top_n=args.top_n,
+        score_min_days=252,
+        members=members,
+    )
 
-    n_pairs = len(elig)
-    slot = args.capital / n_pairs
-    start_req = pd.Timestamp("2021-01-01")
-    start = max(start_req, close.index.min())
+    traded_path = out_dir / f"top{args.top_n}_significant_pe_pairs.csv"
+    elig.to_csv(traded_path, index=False)
+    print(f"Traded pairs -> {traded_path} ({len(elig)} rows)")
+
+    start = max(pd.Timestamp("2021-01-01"), close.index.min())
     end = close.index.max()
     calendar = close.loc[close.index >= start].index
 
-    print(f"Eligible pairs: {n_pairs}; slot=${slot:,.2f}; start={start.date()}; end={end.date()}")
+    n_pairs = len(elig)
 
-    all_trades: list[dict] = []
-    slot_pnls: list[pd.Series] = []
+    print(f"Sector: {args.sector} | metric=pe")
+    print(
+        f"Eligible pairs: {n_pairs} (max concurrent slots={args.top_n}); "
+        f"allocation=equal among active trades; capital=${args.capital:,.0f}; "
+        f"z_entry={t['z_entry']}; z_exit={t['z_exit']}; "
+        f"trade_start={start.date()}; end={end.date()}"
+    )
 
-    for _, row in elig.iterrows():
-        a, b = row["symbol_a"], row["symbol_b"]
-        print(f"  Backtesting {a}-{b} (score={row['score']:.3f})...")
-        trades, daily = generate_pair_trades(pe, close, a, b, start, slot)
-        for t in trades:
-            t["score"] = float(row["score"])
-        all_trades.extend(trades)
-        daily = daily.reindex(calendar).fillna(0.0)
-        slot_pnls.append(daily)
+    if n_pairs == 0:
+        print("  No scorable significant pairs; writing flat (cash) strategy returns.")
+        all_trades: list[dict] = []
+        daily_total = pd.Series(0.0, index=calendar, dtype=float)
+    else:
+        for _, row in elig.iterrows():
+            print(f"  Eligible {row['symbol_a']}-{row['symbol_b']} (score={row['score']:.3f})")
+        all_trades, daily_total = simulate_sector_portfolio(
+            panel,
+            close,
+            elig,
+            start=start,
+            capital=args.capital,
+            metric=metric,
+            max_slots=args.top_n,
+        )
+        daily_total = daily_total.reindex(calendar).fillna(0.0)
 
-    pnl_matrix = pd.concat(slot_pnls, axis=1).fillna(0.0)
-    daily_total = pnl_matrix.sum(axis=1)
     strategy = args.capital + daily_total.cumsum()
     strategy.name = "strategy_value"
 
-    healthcare, bench_ticker = fetch_healthcare_equity(start, end, calendar)
+    # Daily simple returns for multi-sector combiner (independent of absolute capital)
+    daily_ret = strategy.pct_change().fillna(0.0)
+    daily_ret.name = "strategy_return"
+    ret_out = pd.DataFrame({"date": calendar, "strategy_return": daily_ret.reindex(calendar).fillna(0.0).to_numpy()})
+    ret_path = out_dir / "strategy_daily_returns.csv"
+    ret_out.to_csv(ret_path, index=False)
+    print(f"Wrote {ret_path}")
+
+    benchmark, bench_ticker = fetch_benchmark_equity(
+        start,
+        end,
+        calendar,
+        primary=bench_cfg["primary"],
+        fallback=bench_cfg["fallback"],
+        capital=args.capital,
+    )
 
     strat_vals = strategy.reindex(calendar).to_numpy(dtype=float)
-    hc_vals = healthcare.reindex(calendar).to_numpy(dtype=float)
+    bench_vals = benchmark.reindex(calendar).to_numpy(dtype=float)
     equity_df = pd.DataFrame(
         {
             "date": calendar,
             "strategy_value": strat_vals,
-            "healthcare_value": hc_vals,
+            "benchmark_value": bench_vals,
             "strategy_return_pct": strat_vals / args.capital - 1.0,
-            "healthcare_return_pct": hc_vals / args.capital - 1.0,
+            "benchmark_return_pct": bench_vals / args.capital - 1.0,
         }
     )
 
@@ -463,51 +622,74 @@ def main() -> None:
         trades_df = trades_df[cols]
 
     strat_final = float(equity_df["strategy_value"].iloc[-1])
-    hc_final = float(equity_df["healthcare_value"].iloc[-1])
+    bench_final = float(equity_df["benchmark_value"].iloc[-1])
     strat_ret = strat_final / args.capital - 1.0
-    hc_ret = hc_final / args.capital - 1.0
+    bench_ret = bench_final / args.capital - 1.0
     mdd = max_drawdown(equity_df.set_index("date")["strategy_value"])
 
-    pairs_out = elig[
-        ["symbol_a", "symbol_b", "score", "pearson_r", "adf_t", "half_life", "exc_ge_1_5", "revert_rate"]
-    ].copy()
-    if "security_a" in elig.columns:
-        pairs_out.insert(2, "security_a", elig["security_a"])
-        pairs_out.insert(3, "security_b", elig["security_b"])
+    if n_pairs:
+        pairs_out = elig[
+            ["symbol_a", "symbol_b", "score", "pearson_r", "adf_t", "half_life", "exc_ge_1_5", "revert_rate"]
+        ].copy()
+        if "security_a" in elig.columns:
+            pairs_out.insert(2, "security_a", elig["security_a"])
+            pairs_out.insert(3, "security_b", elig["security_b"])
+    else:
+        pairs_out = pd.DataFrame(
+            columns=["symbol_a", "symbol_b", "score", "pearson_r", "adf_t", "half_life", "exc_ge_1_5", "revert_rate"]
+        )
 
     summary_rows = [
+        ("Sector", args.sector),
+        ("Metric", "PE"),
         ("Initial capital (USD)", float(args.capital)),
-        ("Score filter", f"> {args.score_min}"),
-        ("Number of pairs / slots", n_pairs),
-        ("Slot notional (USD)", float(slot)),
-        ("Requested start", "2021-01-01"),
-        ("Actual start (data)", start.strftime("%Y-%m-%d")),
+        ("Pair selection", f"Top {args.top_n} same-subindustry significant pairs by score"),
+        ("Eligible pairs", n_pairs),
+        ("Max concurrent slots", int(args.top_n)),
+        (
+            "Capital allocation",
+            "Equal dynamic split of sector capital among active trades (rebalance on entry/exit)",
+        ),
+        ("Trade start", start.strftime("%Y-%m-%d")),
         ("End date", end.strftime("%Y-%m-%d")),
-        ("Entry rule", f"|z| >= {THRESHOLDS['z_entry']}"),
-        ("Exit rule", f"|z| <= {THRESHOLDS['z_exit']}"),
+        ("Pair universe", "same_gics_subindustry"),
+        ("Entry rule", f"|z| >= {t['z_entry']}"),
+        ("Exit rule", f"|z| <= {t['z_exit']}"),
         ("Z warm-up (days)", WARMUP),
-        ("Benchmark label", BENCH_LABEL),
+        ("Benchmark label", bench_label),
         ("Benchmark ticker used", bench_ticker),
         ("Final strategy value (USD)", strat_final),
-        (f"Final {BENCH_LABEL} value (USD)", hc_final),
+        (f"Final {bench_label} value (USD)", bench_final),
         ("Strategy total return", strat_ret),
-        (f"{BENCH_LABEL} total return", hc_ret),
+        (f"{bench_label} total return", bench_ret),
         ("Strategy max drawdown", mdd),
         ("Number of trades", int(len(trades_df))),
         ("Total trade PnL (USD)", float(trades_df["pnl_usd"].sum()) if not trades_df.empty else 0.0),
     ]
 
-    chart_png = render_performance_history_png(equity_df)
-    # Also save a standalone PNG next to the workbook for easy viewing
+    chart_png = render_performance_history_png(equity_df, bench_label, strategy_label=strategy_label)
     (out_dir / "performance_history.png").write_bytes(chart_png)
 
     out_path = out_dir / "portfolio_backtest.xlsx"
-    write_excel(out_path, summary_rows, pairs_out, equity_df, trades_df, chart_png)
+    # Excel Equity sheet: prefer clean columns (drop aliases)
+    equity_xlsx = equity_df[
+        ["date", "strategy_value", "benchmark_value", "strategy_return_pct", "benchmark_return_pct"]
+    ].copy()
+    write_excel(
+        out_path,
+        summary_rows,
+        pairs_out,
+        equity_xlsx,
+        trades_df,
+        chart_png,
+        bench_label,
+        strategy_label=strategy_label,
+    )
     print(f"\nWrote {out_path}")
     print(f"Also wrote {out_dir / 'performance_history.png'}")
     print(
         f"Strategy: ${strat_final:,.2f} ({strat_ret:.1%}) | "
-        f"{BENCH_LABEL} ({bench_ticker}): ${hc_final:,.2f} ({hc_ret:.1%})"
+        f"{bench_label} ({bench_ticker}): ${bench_final:,.2f} ({bench_ret:.1%})"
     )
     print(f"Trades: {len(trades_df)} | Max DD: {mdd:.1%}")
 

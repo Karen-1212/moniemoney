@@ -1,4 +1,9 @@
 {
+  "metric": "pe",
+  "mode": "full_sample",
+  "data_start": null,
+  "train_end": null,
+  "n_days_min": 924,
   "thresholds": {
     "n_days_min": 924,
     "corr_min": 0.65,
@@ -7,8 +12,8 @@
     "half_life_max": 250.0,
     "exc_ge_1_5_min": 3,
     "revert_rate_min": 0.6,
-    "z_entry": 1.5,
-    "z_exit": 0.5,
+    "z_entry": 1.2,
+    "z_exit": 0.75,
     "max_pairs_per_ticker": 2
   },
   "score_weights": {
@@ -19,5 +24,6 @@
     "rev": 0.1
   },
   "half_life_target": 45.0,
-  "sector": "Health Care"
+  "sector": "Consumer Discretionary",
+  "pair_universe": "same_gics_subindustry"
 }

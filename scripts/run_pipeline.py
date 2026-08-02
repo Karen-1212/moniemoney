@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run sector PE pipeline. Default: Health Care only."""
+"""Build Consumer Discretionary PE panels and significant same-subindustry pairs."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ import yfinance as yf
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src import CACHE_DIR, SECTORS_DIR, SP500_PATH, sector_dir, sector_slug
+from src import CACHE_DIR, DEFAULT_SECTOR, SP500_PATH, sector_dir, sector_slug
 from src.eps import build_eps_panel
-from src.pe_stats import significant_pe_pairs
+from src.pe_stats import significant_valuation_pairs
 
 
 def load_universe() -> pd.DataFrame:
@@ -33,8 +33,11 @@ def write_members(universe: pd.DataFrame, sector: str, force: bool = False) -> p
         print(f"members exist: {path}")
         return pd.read_csv(path)
 
+    cols = ["Symbol", "Security"]
+    if "GICS Sub-Industry" in universe.columns:
+        cols.append("GICS Sub-Industry")
     members = (
-        universe.loc[universe["GICS Sector"] == sector, ["Symbol", "Security"]]
+        universe.loc[universe["GICS Sector"] == sector, cols]
         .drop_duplicates(subset=["Symbol"])
         .sort_values("Symbol")
         .reset_index(drop=True)
@@ -52,7 +55,12 @@ def fetch_close(members: pd.DataFrame, sector: str, force: bool = False) -> pd.D
 
     if path.exists() and not force:
         print(f"close exists: {path}")
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        return pd.read_csv(path, index_col=0, parse_dates=True)
+
+    if cache_path.exists() and not force:
+        print(f"close from cache: {cache_path}")
+        df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df.to_csv(path)
         return df
 
     symbols = members["Symbol"].tolist()
@@ -70,16 +78,13 @@ def fetch_close(members: pd.DataFrame, sector: str, force: bool = False) -> pd.D
         if "Close" in raw.columns.get_level_values(0):
             close = raw["Close"].copy()
         else:
-            # sometimes (ticker, OHLCV)
             close = raw.xs("Close", axis=1, level=-1).copy()
     else:
-        # single ticker edge case
         close = raw[["Close"]].copy()
         close.columns = symbols[:1]
 
     close = close.sort_index()
     close.index = pd.to_datetime(close.index).tz_localize(None)
-    # ensure all symbols present
     for sym in symbols:
         if sym not in close.columns:
             close[sym] = pd.NA
@@ -109,19 +114,18 @@ def build_pe(close: pd.DataFrame, eps: pd.DataFrame, sector: str, force: bool = 
     out_dir = sector_dir(sector)
     path = out_dir / "pe.csv"
     if path.exists() and not force:
-        print(f"pe exists: {path}")
+        print(f"PE exists: {path}")
         return pd.read_csv(path, index_col=0, parse_dates=True)
 
-    # align
     common_cols = [c for c in close.columns if c in eps.columns]
     pe = close[common_cols] / eps[common_cols]
     pe = pe.where(eps[common_cols] > 0)
     pe.to_csv(path)
-    print(f"Wrote pe -> {path}  shape={pe.shape}")
+    print(f"Wrote PE -> {path}  shape={pe.shape}")
     return pe
 
 
-def correlate(pe: pd.DataFrame, members: pd.DataFrame, sector: str, force: bool = False) -> pd.DataFrame:
+def correlate(panel: pd.DataFrame, members: pd.DataFrame, sector: str, force: bool = False) -> pd.DataFrame:
     out_dir = sector_dir(sector)
     path = out_dir / "significant_pe_pairs.csv"
     if path.exists() and not force:
@@ -129,22 +133,16 @@ def correlate(pe: pd.DataFrame, members: pd.DataFrame, sector: str, force: bool 
         return pd.read_csv(path)
 
     print("Computing significant PE pairs...")
-    pairs = significant_pe_pairs(pe, members)
+    pairs = significant_valuation_pairs(panel, members, metric="pe")
     pairs.insert(0, "sector", sector)
     pairs.to_csv(path, index=False)
-    rollup = SECTORS_DIR / "all_significant_pe_pairs.csv"
-    pairs.to_csv(rollup, index=False)
     print(f"Wrote {len(pairs)} significant pairs -> {path}")
     return pairs
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sector PE correlation pipeline")
-    parser.add_argument(
-        "--sector",
-        default="Health Care",
-        help='GICS sector name (default: "Health Care")',
-    )
+    parser = argparse.ArgumentParser(description="Consumer Discretionary relative-PE pipeline")
+    parser.add_argument("--sector", default=DEFAULT_SECTOR)
     parser.add_argument("--force", action="store_true", help="Rebuild all outputs")
     parser.add_argument(
         "--skip-eps",
@@ -159,13 +157,16 @@ def main() -> None:
     if args.sector not in sectors:
         raise SystemExit(f"Unknown sector {args.sector!r}. Available: {sectors}")
 
-    print(f"=== Sector: {args.sector} ===")
+    print(f"=== Sector: {args.sector} | metric=pe ===")
     members = write_members(universe, args.sector, force=args.force)
     close = fetch_close(members, args.sector, force=args.force)
-    if args.skip_eps and (sector_dir(args.sector) / "eps_365.csv").exists():
-        eps = pd.read_csv(sector_dir(args.sector) / "eps_365.csv", index_col=0, parse_dates=True)
+
+    eps_path = sector_dir(args.sector) / "eps_365.csv"
+    if args.skip_eps and eps_path.exists():
+        eps = pd.read_csv(eps_path, index_col=0, parse_dates=True)
     else:
         eps = build_eps(members, close, args.sector, force=args.force)
+
     pe = build_pe(close, eps, args.sector, force=args.force)
     pairs = correlate(pe, members, args.sector, force=args.force)
 

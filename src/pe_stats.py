@@ -1,12 +1,13 @@
-"""PE pair correlation and relative-PE statistics (numpy-only)."""
+"""PE pair correlation and relative-multiple statistics (numpy-only)."""
 
 from __future__ import annotations
 
 import math
-from itertools import combinations
 
 import numpy as np
 import pandas as pd
+
+from src import load_subindustry_map, same_subindustry_combinations
 
 
 def pearsonr_pvalue(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
@@ -103,25 +104,35 @@ def mean_ci_99(x: np.ndarray) -> tuple[float, float, float]:
     return mean, mean - tcrit * se, mean + tcrit * se
 
 
-def significant_pe_pairs(
-    pe: pd.DataFrame,
+def significant_valuation_pairs(
+    panel: pd.DataFrame,
     members: pd.DataFrame,
+    metric: str = "pe",
     min_days: int = 252,
     p_threshold: float = 0.01,
 ) -> pd.DataFrame:
-    """Find within-panel pairs with significant PE correlation and log relative PE stats."""
+    """Find same-subindustry pairs with significant correlation and log relative-multiple stats."""
+    metric = metric.lower()
+    mean_col = f"mean_log_rel_{metric}"
+    exp_col = f"exp_mean_log_rel_{metric}"
     name_map = dict(zip(members["Symbol"], members["Security"]))
-    tickers = [c for c in pe.columns if pe[c].notna().sum() >= min_days]
+    sub_map = load_subindustry_map(members)
+    tickers = [c for c in panel.columns if panel[c].notna().sum() >= min_days]
     rows = []
 
-    pairs = list(combinations(sorted(tickers), 2))
-    print(f"  Evaluating {len(pairs)} pairs among {len(tickers)} tickers...", flush=True)
+    pairs = list(same_subindustry_combinations(tickers, sub_map))
+    n_subs = len({sub_map[t] for t in tickers if t in sub_map})
+    print(
+        f"  Evaluating {len(pairs)} same-subindustry pairs "
+        f"among {len(tickers)} tickers ({n_subs} sub-industries)...",
+        flush=True,
+    )
 
     for i, (a, b) in enumerate(pairs, 1):
         if i % 500 == 0:
             print(f"    pair {i}/{len(pairs)}", flush=True)
-        sub = pe[[a, b]].dropna()
-        # require positive PE for relative PE and correlation on same mask
+        sub = panel[[a, b]].dropna()
+        # require positive multiples for relative ratio and correlation on same mask
         sub = sub[(sub[a] > 0) & (sub[b] > 0)]
         n = len(sub)
         if n < min_days:
@@ -133,19 +144,21 @@ def significant_pe_pairs(
             continue
         rel = np.log(xa / xb)
         mean_rel, lo, hi = mean_ci_99(rel)
+        si = sub_map.get(a, "")
         rows.append(
             {
                 "symbol_a": a,
                 "security_a": name_map.get(a, ""),
                 "symbol_b": b,
                 "security_b": name_map.get(b, ""),
+                "subindustry": si,
                 "n_days": n,
                 "pearson_r": r,
                 "p_value": p,
-                "mean_log_rel_pe": mean_rel,
+                mean_col: mean_rel,
                 "ci99_low": lo,
                 "ci99_high": hi,
-                "exp_mean_log_rel_pe": float(np.exp(mean_rel)),
+                exp_col: float(np.exp(mean_rel)),
             }
         )
 
@@ -153,3 +166,15 @@ def significant_pe_pairs(
     if not out.empty:
         out = out.sort_values(["p_value", "pearson_r"], ascending=[True, False]).reset_index(drop=True)
     return out
+
+
+def significant_pe_pairs(
+    pe: pd.DataFrame,
+    members: pd.DataFrame,
+    min_days: int = 252,
+    p_threshold: float = 0.01,
+) -> pd.DataFrame:
+    """Find within-panel pairs with significant PE correlation and log relative PE stats."""
+    return significant_valuation_pairs(
+        pe, members, metric="pe", min_days=min_days, p_threshold=p_threshold
+    )
